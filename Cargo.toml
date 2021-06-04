@@ -1,0 +1,17 @@
+[package]
+name = "leitio"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+flize = {git = "https://github.com/xacrimon/flize", branch = "v5"}
+
+[dev-dependencies]
+criterion = "0.3"
+flume = "*"
+
+[[bench]]
+name = "insert"
+harness = false
