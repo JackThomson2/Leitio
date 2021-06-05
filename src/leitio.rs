@@ -1,5 +1,5 @@
-use flize::{unprotected, Atomic, Collector, Shared, Shield, ThinShield};
-/// Based on https://github.com/xacrimon/flize/blob/3358915c7d13c09a04d34537869c0f380339b298/examples/queue/src/lib.rs#L1
+use flize::{Atomic, Collector, Shared, Shield, ThinShield};
+/// Based on https://github.com/xacrimon/flize/blob/3358915c7d13c09a04d34537869c0f380339b298/examples/leitio/src/lib.rs#L1
 use flize::{CachePadded, NullTag};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::usize;
@@ -7,13 +7,34 @@ use std::usize;
 const BUFFER_SIZE: usize = 1024;
 const BUFFER_SIZE_MINUS: usize = BUFFER_SIZE - 1;
 
-pub struct Queue<T: Clone> {
+pub struct Leitio<T: Clone> {
     collector: Collector,
     head: Atomic<Node<T>, NullTag, NullTag, 0, 0>,
     tail: Atomic<Node<T>, NullTag, NullTag, 0, 0>,
+    count: AtomicUsize,
 }
 
-impl<T: Clone> Queue<T> {
+impl<T: Clone> Leitio<T> {
+    #[inline]
+    pub fn iter(&self) -> IntoIter<T> {
+        self.into_iter()
+    }
+
+    #[inline]
+    fn inc_count(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn dec_count(&self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
     #[inline]
     fn cas_tail<'s, S>(
         &self,
@@ -52,6 +73,7 @@ impl<T: Clone> Queue<T> {
             collector: Collector::new(),
             head: Atomic::new(sentinel),
             tail: Atomic::new(sentinel),
+            count: AtomicUsize::new(0),
         }
     }
 
@@ -84,6 +106,7 @@ impl<T: Clone> Queue<T> {
 
                     if ltailr.cas_next(Shared::null(), new_node, &shield) {
                         self.cas_tail(ltail, new_node, &shield);
+                        self.inc_count();
                         return;
                     }
 
@@ -103,6 +126,7 @@ impl<T: Clone> Queue<T> {
                 )
                 .is_ok()
             {
+                self.inc_count();
                 return;
             }
         }
@@ -147,23 +171,50 @@ impl<T: Clone> Queue<T> {
                 continue;
             }
 
+            self.dec_count();
             return Some(unsafe { item.as_ref_unchecked() });
         }
     }
 }
 
-impl<T: Clone> Drop for Queue<T> {
+/// An owned iterator over the msgs received from a channel.
+pub struct IntoIter<'s, T: Clone> {
+    receiver: &'s Leitio<T>,
+    shield: ThinShield<'s>,
+}
+
+impl<'s, T: Clone> Iterator for IntoIter<'s, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.receiver.pop(&self.shield).cloned()
+    }
+}
+
+impl<'a, T: Clone> IntoIterator for &'a Leitio<T> {
+    type Item = T;
+    type IntoIter = IntoIter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter {
+            receiver: self,
+            shield: self.get_shield(),
+        }
+    }
+}
+
+impl<T: Clone> Drop for Leitio<T> {
     fn drop(&mut self) {
         unsafe {
             let shield = flize::unprotected();
-            while let Some(_) = self.pop(shield) {}
+            while self.pop(shield).is_some() {}
             let lhead = self.head.load(Ordering::SeqCst, shield);
             Box::from_raw(lhead.as_ptr());
         }
     }
 }
 
-impl<T: Clone> Default for Queue<T> {
+impl<T: Clone> Default for Leitio<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -228,38 +279,89 @@ impl<T: Clone> Node<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::other::Queue;
+    use std::{
+        sync::Arc,
+        thread::{self, sleep},
+        time::Duration,
+    };
+
+    use crate::Leitio;
 
     #[test]
     fn try_add_few_poll() {
-        let new_queue = Queue::new();
+        let new_leitio = Leitio::new();
 
         for _i in 0..20 {
-            let found = new_queue.push(200);
+            let _found = new_leitio.push(200);
         }
 
-        let shield = new_queue.get_shield();
+        let shield = new_leitio.get_shield();
 
         for _i in 0..20 {
-            let found = new_queue.pop(&shield);
+            let found = new_leitio.pop(&shield);
             assert_eq!(found.unwrap(), &200);
         }
     }
 
     #[test]
     fn try_add_many_poll() {
-        let new_queue = Queue::new();
+        let new_leitio = Leitio::new();
 
         const RUNS: usize = 2_000;
 
         for _i in 0..RUNS {
-            let found = new_queue.push(200);
+            let _found = new_leitio.push(200);
         }
-        let shield = new_queue.get_shield();
+        let shield = new_leitio.get_shield();
 
-        for i in 0..RUNS {
-            let found = new_queue.pop(&shield);
+        for _i in 0..RUNS {
+            let found = new_leitio.pop(&shield);
             assert_eq!(found.unwrap(), &200);
         }
+    }
+
+    #[test]
+    fn try_iter() {
+        let new_leitio = Leitio::new();
+
+        const RUNS: usize = 2_000;
+
+        const EXPECTED: usize = RUNS * 200;
+
+        for _i in 0..RUNS {
+            let _found = new_leitio.push(200);
+        }
+
+        let count: usize = new_leitio.iter().sum();
+
+        assert_eq!(EXPECTED, count);
+    }
+
+    #[test]
+    fn try_threads() {
+        let new_leitio = Leitio::new();
+
+        let shared = Arc::new(new_leitio);
+
+        const RUNS: usize = 2_000_000;
+        const THREADS: usize = 4;
+        const EXPECTED: usize = RUNS * 200 * THREADS;
+
+        for _i in 0..THREADS {
+            let clone = shared.clone();
+            thread::spawn(move || {
+                for _i in 0..RUNS {
+                    clone.push(200);
+                }
+            });
+        }
+
+        sleep(Duration::from_millis(1000));
+
+        let count: usize = shared.iter().sum();
+
+        println!("We got {}", count);
+
+        assert_eq!(EXPECTED, count);
     }
 }
